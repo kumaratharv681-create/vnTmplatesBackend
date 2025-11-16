@@ -1327,13 +1327,16 @@ def check_subscription(user_id):
 
     try:
         if db is None:
-            return jsonify({"isPremium": False}), 200
+            return jsonify({
+                'isPremium': False,
+                'plan': None,
+                'expiresAt': None
+            }), 200
 
-        subs_snapshot = db.collection('subscriptions') \
-            .where(filter=FieldFilter('userId', '==', user_id)) \
-            .where(filter=FieldFilter('status', '==', 'active')) \
-            .order_by('expiresAt', direction='DESCENDING') \
-            .limit(5) \
+        # 🔥 Simplified query — no index required
+        subs_ref = db.collection("subscriptions") \
+            .where(filter=FieldFilter("userId", "==", user_id)) \
+            .limit(15) \
             .stream(timeout=5)
 
         is_premium = False
@@ -1341,29 +1344,41 @@ def check_subscription(user_id):
         expiry_date_str = None
         now_time = now_utc()
 
-        for doc in subs_snapshot:
+        for doc in subs_ref:
             data = doc.to_dict()
-            expires_at = data.get('expiresAt')
+            status = data.get("status")
+            expires_at = data.get("expiresAt")
 
-            if expires_at:
-                try:
-                    expiry_date = datetime.fromisoformat(
-                        expires_at.replace('Z', '+00:00')
-                    )
-                    if expiry_date > now_time:
-                        is_premium = True
-                        active_plan = data.get('plan')
-                        expiry_date_str = expires_at
-                        break
-                except Exception as e:
-                    print(f"⚠️ Expiry parse error: {e}")
-                    continue
+            if status != "active" or not expires_at:
+                continue
+
+            try:
+                expiry_date = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+
+                if expiry_date > now_time:
+                    is_premium = True
+                    active_plan = data.get("plan")
+                    expiry_date_str = expires_at
+                    break
+
+            except Exception as e:
+                print("⚠️ Expiry parse error:", e)
+                continue
 
         return jsonify({
-            'isPremium': is_premium,
-            'plan': active_plan,
-            'expiresAt': expiry_date_str
+            "isPremium": is_premium,
+            "plan": active_plan,
+            "expiresAt": expiry_date_str
         }), 200
+
+    except Exception as e:
+        print("❌ Check subscription error:", e)
+        return jsonify({
+            "isPremium": False,
+            "plan": None,
+            "expiresAt": None
+        }), 200
+
 
     except Exception as e:
         print(f"❌ Check subscription error: {e}")
@@ -2218,4 +2233,5 @@ if __name__ == "__main__":
     
     # ✅ Production mode: Gunicorn will handle this
     # Development mode: Flask development server
+
     app.run(host="0.0.0.0", port=port, debug=False)
