@@ -78,13 +78,25 @@ def now_str():
 app = Flask(__name__)
 
 # ✅ SUPER SIMPLE CORS - Development Mode
-CORS(app, 
-     resources={r"/*": {"origins": "*"}},
-     supports_credentials=True,
-     allow_headers=["Content-Type", "Authorization", "x-admin-session", "X-Admin-Session"],
-     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-     expose_headers=["Content-Type", "Authorization"])
+CORS(app, resources={
+    r"/api/*": {
+        "origins": ["http://localhost:5173", "https://yourdomain.com"],
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization", "Accept"],
+        "expose_headers": ["Content-Type"],
+        "supports_credentials": False,
+        "max_age": 3600
+    }
+})
 
+# Add CORS headers manually to all responses
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    return response
+    
 # ✅ Handle ALL OPTIONS requests globally
 @app.before_request
 def handle_preflight():
@@ -96,14 +108,6 @@ def handle_preflight():
         response.headers['Access-Control-Allow-Credentials'] = 'true'
         return response
 
-# ✅ Add headers to ALL responses
-@app.after_request
-def after_request(response):
-    response.headers['Access-Control-Allow-Origin'] = request.headers.get('Origin', '*')
-    response.headers['Access-Control-Allow-Credentials'] = 'true'
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, x-admin-session, X-Admin-Session'
-    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
-    return response
 
 # ----------------- Cloudinary -----------------
 cloudinary.config(
@@ -2361,4 +2365,5 @@ if __name__ == "__main__":
     # Development mode: Flask development server
 
     app.run(host="0.0.0.0", port=port, debug=False)
+
 
