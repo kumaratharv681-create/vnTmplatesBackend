@@ -654,7 +654,60 @@ def get_user_by_uid(uid):
         if "deadline exceeded" in str(e).lower() or "timeout" in str(e).lower():
             return jsonify({"error": "Database timeout, please try again"}), 504
         return jsonify({"error": "Internal server error"}), 500
+
+
+# ==================== GET BONUS DOWNLOADS ====================
+@app.route("/api/users/<user_id>/bonus-downloads", methods=["GET", "OPTIONS"])
+def get_bonus_downloads(user_id):
+    """Get user's bonus downloads count"""
     
+    if request.method == "OPTIONS":
+        return '', 200
+    
+    try:
+        print(f"🔍 Fetching bonus downloads for: {user_id}")
+        
+        if db is None:
+            return jsonify({"error": "Database not available"}), 503
+        
+        if not user_id or user_id.strip() == "":
+            return jsonify({"error": "Invalid user ID"}), 400
+        
+        # Get user document
+        user_ref = db.collection("users").document(user_id)
+        user_doc = user_ref.get(timeout=10)
+        
+        if not user_doc.exists:
+            print(f"⚠️ User not found: {user_id}")
+            return jsonify({
+                "bonusDownloads": 0,
+                "message": "User not found"
+            }), 404
+        
+        user_data = user_doc.to_dict()
+        bonus_downloads = user_data.get("bonusDownloads", 0)
+        
+        print(f"✅ Bonus downloads for {user_id}: {bonus_downloads}")
+        
+        return jsonify({
+            "bonusDownloads": bonus_downloads,
+            "userId": user_id
+        }), 200
+        
+    except Exception as e:
+        print(f"❌ Error fetching bonus downloads: {e}")
+        traceback.print_exc()
+        
+        if "timeout" in str(e).lower():
+            return jsonify({
+                "bonusDownloads": 0,
+                "error": "Timeout"
+            }), 504
+        
+        return jsonify({
+            "error": "Internal server error",
+            "message": str(e)
+        }), 500
 # ==================== Use Bonus Download ====================
 @app.route("/api/users/<user_id>/use-bonus-download", methods=["POST", "OPTIONS"])
 def use_bonus_download(user_id):
@@ -2308,3 +2361,4 @@ if __name__ == "__main__":
     # Development mode: Flask development server
 
     app.run(host="0.0.0.0", port=port, debug=False)
+
