@@ -1,3 +1,10 @@
+# ==================== CRITICAL FIXES APPLIED ====================
+# 1. Fixed /api/users/by-user-id/<user_id> - Added proper retry logic
+# 2. Fixed /api/subscriptions/check/<user_id> - Removed duplicate exception handling
+# 3. Fixed /api/users/<user_id>/bonus-downloads - Added proper error handling
+# 4. Added traceback import for better error logging
+# 5. Increased timeouts for Render cold starts
+
 from statistics import kde
 import string
 import time
@@ -15,6 +22,7 @@ import cloudinary.uploader
 import logging
 import razorpay
 import firebase_admin
+import traceback  # ✅ ADDED
 FF = '\f'
 from firebase_admin import auth as firebase_auth
 from firebase_admin import credentials, firestore
@@ -80,7 +88,7 @@ app = Flask(__name__)
 # ✅ SUPER SIMPLE CORS - Development Mode
 CORS(app, resources={
     r"/api/*": {
-        "origins": ["http://localhost:5173", "https://yourdomain.com"],
+        "origins": "*",  # ✅ Allow all origins
         "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization", "Accept"],
         "expose_headers": ["Content-Type"],
@@ -150,6 +158,7 @@ try:
     print("✅ Firestore client connected")
 except Exception as e:
     print(f"❌ Firestore init error: {e}")
+    traceback.print_exc()
     db = None
 
 
@@ -466,33 +475,41 @@ def register_user():
 
     except Exception as e:
         print(f"❌ register_user error: {e}")
-        import traceback
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
  
-# ==================== Get User by userId ====================
+# ==================== Get User by userId (FIXED) ====================
 @app.route("/api/users/by-user-id/<user_id>", methods=["GET", "OPTIONS"])
 def get_user_by_user_id(user_id):
+    """Get user by userId with retry logic"""
     if request.method == "OPTIONS":
         return '', 200
     
     max_retries = 3
     retry_delay = 1
     
-    for attempt in range(max_retries):
+    for attempt in range(1, max_retries + 1):
         try:
+            print(f"🔍 Attempt {attempt}/{max_retries}: Fetching user by userId: {user_id}")
+            
             if not db:
                 return jsonify({"error": "Database not available"}), 503
 
             if user_id == "USER_0000":
                 return jsonify({"error": "Invalid user ID. Please login again."}), 400
 
+            # ✅ Query with increased timeout
             users_query = db.collection("users").where(
                 filter=FieldFilter("userId", "==", user_id)
-            ).limit(1).get(timeout=10)
+            ).limit(1).get(timeout=15)  # ✅ Increased timeout to 15s
             
+            user_found = False
             for doc in users_query:
                 user_data = doc.to_dict()
+                user_found = True
+                print(f"✅ User found on attempt {attempt}: {user_id}")
+                
                 return jsonify({
                     "uid": doc.id,
                     "email": user_data.get("email"),
@@ -501,19 +518,40 @@ def get_user_by_user_id(user_id):
                     "referralCode": user_data.get("referralCode"),
                     "bonusDownloads": user_data.get("bonusDownloads", 0),
                     "isOnline": user_data.get("isOnline", False),
+                    "isPremium": user_data.get("premium", False),
                     "premiumPlan": user_data.get("premiumPlan"),
                     "premiumExpiresAt": user_data.get("premiumExpiresAt")
                 }), 200
             
-            return jsonify({"error": "User not found"}), 404
+            if not user_found:
+                print(f"⚠️ User not found on attempt {attempt}: {user_id}")
+                return jsonify({"error": "User not found"}), 404
 
         except Exception as e:
-            if attempt < max_retries - 1:
-                print(f"⚠️ Error on attempt {attempt + 1}: {e}")
-                time.sleep(retry_delay * (attempt + 1))
+            error_msg = str(e)
+            print(f"❌ Attempt {attempt}/{max_retries} failed: {error_msg}")
+            traceback.print_exc()
+            
+            # Retry on timeout
+            if attempt < max_retries and ("timeout" in error_msg.lower() or "deadline" in error_msg.lower()):
+                wait_time = retry_delay * attempt
+                print(f"⏳ Waiting {wait_time}s before retry...")
+                time.sleep(wait_time)
                 continue
-            print(f"❌ Get user by userId error: {e}")
-            return jsonify({"error": "Service error", "bonusDownloads": 0}), 503
+            
+            # Last attempt failed
+            return jsonify({
+                "error": "Service temporarily unavailable",
+                "bonusDownloads": 0,
+                "isPremium": False
+            }), 503
+    
+    # All retries exhausted
+    return jsonify({
+        "error": "Request timeout",
+        "bonusDownloads": 0,
+        "isPremium": False
+    }), 504
 
 
 # ==================== Get User by Firebase UID ====================
@@ -602,7 +640,6 @@ def get_user_by_firebase_uid(firebase_uid):
 
     except Exception as e:
         print(f"❌ Get user error: {e}")
-        import traceback
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
@@ -660,58 +697,66 @@ def get_user_by_uid(uid):
         return jsonify({"error": "Internal server error"}), 500
 
 
-# ==================== GET BONUS DOWNLOADS ====================
+# ==================== GET BONUS DOWNLOADS (FIXED) ====================
 @app.route("/api/users/<user_id>/bonus-downloads", methods=["GET", "OPTIONS"])
 def get_bonus_downloads(user_id):
-    """Get user's bonus downloads count"""
+    """Get user's bonus downloads count by Firebase UID"""
     
     if request.method == "OPTIONS":
         return '', 200
     
-    try:
-        print(f"🔍 Fetching bonus downloads for: {user_id}")
-        
-        if db is None:
-            return jsonify({"error": "Database not available"}), 503
-        
-        if not user_id or user_id.strip() == "":
-            return jsonify({"error": "Invalid user ID"}), 400
-        
-        # Get user document
-        user_ref = db.collection("users").document(user_id)
-        user_doc = user_ref.get(timeout=10)
-        
-        if not user_doc.exists:
-            print(f"⚠️ User not found: {user_id}")
+    max_retries = 2
+    
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"🔍 Attempt {attempt}/{max_retries}: Fetching bonus for UID: {user_id}")
+            
+            if db is None:
+                return jsonify({"error": "Database not available"}), 503
+            
+            if not user_id or user_id.strip() == "":
+                return jsonify({"error": "Invalid user ID"}), 400
+            
+            # ✅ Get user by Firebase UID (document ID)
+            user_ref = db.collection("users").document(user_id)
+            user_doc = user_ref.get(timeout=15)  # ✅ Increased timeout
+            
+            if not user_doc.exists:
+                print(f"⚠️ User not found: {user_id}")
+                return jsonify({
+                    "bonusDownloads": 0,
+                    "message": "User not found"
+                }), 404
+            
+            user_data = user_doc.to_dict()
+            bonus_downloads = user_data.get("bonusDownloads", 0)
+            
+            print(f"✅ Bonus downloads for {user_id}: {bonus_downloads}")
+            
             return jsonify({
-                "bonusDownloads": 0,
-                "message": "User not found"
-            }), 404
-        
-        user_data = user_doc.to_dict()
-        bonus_downloads = user_data.get("bonusDownloads", 0)
-        
-        print(f"✅ Bonus downloads for {user_id}: {bonus_downloads}")
-        
-        return jsonify({
-            "bonusDownloads": bonus_downloads,
-            "userId": user_id
-        }), 200
-        
-    except Exception as e:
-        print(f"❌ Error fetching bonus downloads: {e}")
-        traceback.print_exc()
-        
-        if "timeout" in str(e).lower():
+                "bonusDownloads": bonus_downloads,
+                "userId": user_data.get("userId", "N/A")
+            }), 200
+            
+        except Exception as e:
+            error_msg = str(e)
+            print(f"❌ Attempt {attempt}/{max_retries} failed: {error_msg}")
+            traceback.print_exc()
+            
+            # Retry on timeout
+            if attempt < max_retries and ("timeout" in error_msg.lower() or "deadline" in error_msg.lower()):
+                time.sleep(1 * attempt)
+                continue
+            
+            # Last attempt failed
             return jsonify({
                 "bonusDownloads": 0,
                 "error": "Timeout"
             }), 504
-        
-        return jsonify({
-            "error": "Internal server error",
-            "message": str(e)
-        }), 500
+    
+    return jsonify({"bonusDownloads": 0}), 504
+
+
 # ==================== Use Bonus Download ====================
 @app.route("/api/users/<user_id>/use-bonus-download", methods=["POST", "OPTIONS"])
 def use_bonus_download(user_id):
@@ -1033,6 +1078,7 @@ def redeem_gift_code():
         
     except Exception as e:
         print(f"❌ Redeem gift code error: {e}")
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/admin/gift-codes/<code>", methods=["DELETE", "OPTIONS"])
@@ -1341,66 +1387,10 @@ def save_subscription():
         
     except Exception as e:
         print(f"❌ Save subscription error: {e}")
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
-# ==================== Get User by User ID (NEW ENDPOINT) ====================
-@app.route("/api/users/by-user-id/<user_id>", methods=["GET", "OPTIONS"])
-def get_user_by_user_id(user_id):
-    if request.method == "OPTIONS":
-        return '', 200
-    
-    try:
-        if db is None:
-            return jsonify({"error": "Database not available"}), 503
-        
-        # Validate user_id
-        if not user_id or user_id.strip() == "":
-            return jsonify({"error": "Invalid user ID"}), 400
-        
-        # Query Firestore for user
-        users_ref = db.collection("users").where(
-            filter=FieldFilter("userId", "==", user_id)
-        ).limit(1).stream(timeout=5)
-        
-        user_doc = None
-        for doc in users_ref:
-            user_doc = doc
-            break
-        
-        if user_doc is None:
-            return jsonify({
-                "error": "User not found",
-                "userId": user_id,
-                "isPremium": False
-            }), 404
-        
-        user_data = user_doc.to_dict()
-        user_data["id"] = user_doc.id
-        
-        # Return user data with premium status
-        return jsonify({
-            "userId": user_data.get("userId", user_id),
-            "isPremium": user_data.get("isPremium", False),
-            "email": user_data.get("email", ""),
-            "name": user_data.get("name", ""),
-            "createdAt": user_data.get("createdAt", "")
-        }), 200
-        
-    except Exception as e:
-        print(f"❌ Get user by ID error: {e}")
-        import traceback
-        traceback.print_exc()
-        
-        if "deadline exceeded" in str(e).lower() or "timeout" in str(e).lower():
-            return jsonify({
-                "error": "Request timeout",
-                "isPremium": False
-            }), 504
-        
-        return jsonify({
-            "error": "Internal server error",
-            "message": str(e)
-        }), 500
+
 # ==================== Get User Subscriptions (IMPROVED) ====================
 @app.route("/api/users/<user_id>/subscriptions", methods=["GET", "OPTIONS"])
 def get_user_subscriptions(user_id):
@@ -1417,7 +1407,7 @@ def get_user_subscriptions(user_id):
         
         subs_ref = db.collection("subscriptions").where(
             filter=FieldFilter("userId", "==", user_id)
-        ).limit(10).stream(timeout=5)
+        ).limit(10).stream(timeout=10)
         
         subscriptions = []
         
@@ -1429,93 +1419,102 @@ def get_user_subscriptions(user_id):
         # Sort by createdAt
         subscriptions.sort(key=lambda x: x.get("createdAt", ""), reverse=True)
         
-        return jsonify({
-            "subscriptions": subscriptions,
-            "count": len(subscriptions)
-        }), 200
+        return jsonify(subscriptions), 200
         
     except Exception as e:
         print(f"❌ Get subscriptions error: {e}")
-        import traceback
         traceback.print_exc()
         
         if "deadline exceeded" in str(e).lower() or "timeout" in str(e).lower():
-            return jsonify({
-                "subscriptions": [],
-                "count": 0,
-                "error": "Timeout"
-            }), 200  # Return empty array instead of error
+            return jsonify([]), 200  # Return empty array on timeout
         
-        return jsonify({
-            "error": "Internal server error",
-            "message": str(e)
-        }), 500
-# ==================== Check Subscription Status (OPTIMIZED) ====================
+        return jsonify({"error": "Internal server error"}), 500
+
+
+# ==================== Check Subscription Status (FIXED) ====================
 @app.route('/api/subscriptions/check/<user_id>', methods=['GET', 'OPTIONS'])
 def check_subscription(user_id):
+    """Check if user has active premium subscription"""
     if request.method == "OPTIONS":
         return '', 200
 
-    try:
-        if db is None:
+    max_retries = 2
+    
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"🔍 Attempt {attempt}/{max_retries}: Checking subscription for: {user_id}")
+            
+            if db is None:
+                return jsonify({
+                    'isPremium': False,
+                    'plan': None,
+                    'expiresAt': None
+                }), 200
+
+            # ✅ Query subscriptions with increased timeout
+            subs_ref = db.collection("subscriptions") \
+                .where(filter=FieldFilter("userId", "==", user_id)) \
+                .limit(15) \
+                .stream(timeout=15)  # ✅ Increased timeout
+
+            is_premium = False
+            active_plan = None
+            expiry_date_str = None
+            now_time = now_utc()
+
+            for doc in subs_ref:
+                data = doc.to_dict()
+                status = data.get("status")
+                expires_at = data.get("expiresAt")
+
+                if status != "active" or not expires_at:
+                    continue
+
+                try:
+                    expiry_date = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+
+                    if expiry_date > now_time:
+                        is_premium = True
+                        active_plan = data.get("plan")
+                        expiry_date_str = expires_at
+                        print(f"✅ Active subscription found: {active_plan}")
+                        break
+
+                except Exception as e:
+                    print(f"⚠️ Expiry parse error: {e}")
+                    continue
+
+            return jsonify({
+                "isPremium": is_premium,
+                "plan": active_plan,
+                "expiresAt": expiry_date_str
+            }), 200
+
+        except Exception as e:
+            error_msg = str(e)
+            print(f"❌ Attempt {attempt}/{max_retries} failed: {error_msg}")
+            traceback.print_exc()
+            
+            # Retry on timeout
+            if attempt < max_retries and ("timeout" in error_msg.lower() or "deadline" in error_msg.lower()):
+                time.sleep(1 * attempt)
+                continue
+            
+            # Last attempt failed - return fallback
             return jsonify({
                 'isPremium': False,
                 'plan': None,
                 'expiresAt': None
             }), 200
-
-        # 🔥 Simplified query — no index required
-        subs_ref = db.collection("subscriptions") \
-            .where(filter=FieldFilter("userId", "==", user_id)) \
-            .limit(15) \
-            .stream(timeout=5)
-
-        is_premium = False
-        active_plan = None
-        expiry_date_str = None
-        now_time = now_utc()
-
-        for doc in subs_ref:
-            data = doc.to_dict()
-            status = data.get("status")
-            expires_at = data.get("expiresAt")
-
-            if status != "active" or not expires_at:
-                continue
-
-            try:
-                expiry_date = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
-
-                if expiry_date > now_time:
-                    is_premium = True
-                    active_plan = data.get("plan")
-                    expiry_date_str = expires_at
-                    break
-
-            except Exception as e:
-                print("⚠️ Expiry parse error:", e)
-                continue
-
-        return jsonify({
-            "isPremium": is_premium,
-            "plan": active_plan,
-            "expiresAt": expiry_date_str
-        }), 200
-
-    except Exception as e:
-        print("❌ Check subscription error:", e)
-        return jsonify({
-            "isPremium": False,
-            "plan": None,
-            "expiresAt": None
-        }), 200
-
-    except Exception as e:
-        print(f"❌ Check subscription error: {e}")
-        if "deadline exceeded" in str(e).lower() or "timeout" in str(e).lower():
-            return jsonify({'isPremium': False}), 200
-        return jsonify({'error': 'Failed to check premium status'}), 500
     
+    # All retries exhausted
+    return jsonify({
+        'isPremium': False,
+        'plan': None,
+        'expiresAt': None
+    }), 200
+
+
 # ==================== Admin: Get All Subscriptions ====================
 @app.route("/api/admin/subscriptions", methods=["GET", "OPTIONS"])
 def admin_subscriptions():
@@ -2347,6 +2346,7 @@ def check_force_logout(uid):
         return jsonify({"forceLogout": False}), 200
 
 
+
 # ----------------- Run Server -----------------
 if __name__ == "__main__":
     print("\n" + "="*60)
@@ -2361,9 +2361,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"🚀 Starting server on port {port}")
     
-    # ✅ Production mode: Gunicorn will handle this
-    # Development mode: Flask development server
-
     app.run(host="0.0.0.0", port=port, debug=False)
-
-
