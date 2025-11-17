@@ -1286,8 +1286,65 @@ def save_subscription():
         print(f"❌ Save subscription error: {e}")
         return jsonify({"error": str(e)}), 500
 
-
-# ==================== Get User Subscriptions (OPTIMIZED) ====================
+# ==================== Get User by User ID (NEW ENDPOINT) ====================
+@app.route("/api/users/by-user-id/<user_id>", methods=["GET", "OPTIONS"])
+def get_user_by_user_id(user_id):
+    if request.method == "OPTIONS":
+        return '', 200
+    
+    try:
+        if db is None:
+            return jsonify({"error": "Database not available"}), 503
+        
+        # Validate user_id
+        if not user_id or user_id.strip() == "":
+            return jsonify({"error": "Invalid user ID"}), 400
+        
+        # Query Firestore for user
+        users_ref = db.collection("users").where(
+            filter=FieldFilter("userId", "==", user_id)
+        ).limit(1).stream(timeout=5)
+        
+        user_doc = None
+        for doc in users_ref:
+            user_doc = doc
+            break
+        
+        if user_doc is None:
+            return jsonify({
+                "error": "User not found",
+                "userId": user_id,
+                "isPremium": False
+            }), 404
+        
+        user_data = user_doc.to_dict()
+        user_data["id"] = user_doc.id
+        
+        # Return user data with premium status
+        return jsonify({
+            "userId": user_data.get("userId", user_id),
+            "isPremium": user_data.get("isPremium", False),
+            "email": user_data.get("email", ""),
+            "name": user_data.get("name", ""),
+            "createdAt": user_data.get("createdAt", "")
+        }), 200
+        
+    except Exception as e:
+        print(f"❌ Get user by ID error: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        if "deadline exceeded" in str(e).lower() or "timeout" in str(e).lower():
+            return jsonify({
+                "error": "Request timeout",
+                "isPremium": False
+            }), 504
+        
+        return jsonify({
+            "error": "Internal server error",
+            "message": str(e)
+        }), 500
+# ==================== Get User Subscriptions (IMPROVED) ====================
 @app.route("/api/users/<user_id>/subscriptions", methods=["GET", "OPTIONS"])
 def get_user_subscriptions(user_id):
     if request.method == "OPTIONS":
@@ -1296,6 +1353,10 @@ def get_user_subscriptions(user_id):
     try:
         if db is None:
             return jsonify({"error": "Database not available"}), 503
+        
+        # Validate user_id
+        if not user_id or user_id.strip() == "":
+            return jsonify({"error": "Invalid user ID"}), 400
         
         subs_ref = db.collection("subscriptions").where(
             filter=FieldFilter("userId", "==", user_id)
@@ -1308,17 +1369,30 @@ def get_user_subscriptions(user_id):
             sub_data["id"] = doc.id
             subscriptions.append(sub_data)
         
+        # Sort by createdAt
         subscriptions.sort(key=lambda x: x.get("createdAt", ""), reverse=True)
         
-        return jsonify(subscriptions), 200
+        return jsonify({
+            "subscriptions": subscriptions,
+            "count": len(subscriptions)
+        }), 200
         
     except Exception as e:
         print(f"❌ Get subscriptions error: {e}")
+        import traceback
+        traceback.print_exc()
+        
         if "deadline exceeded" in str(e).lower() or "timeout" in str(e).lower():
-            return jsonify([]), 200
-        return jsonify({"error": "Internal server error"}), 500
-
-
+            return jsonify({
+                "subscriptions": [],
+                "count": 0,
+                "error": "Timeout"
+            }), 200  # Return empty array instead of error
+        
+        return jsonify({
+            "error": "Internal server error",
+            "message": str(e)
+        }), 500
 # ==================== Check Subscription Status (OPTIMIZED) ====================
 @app.route('/api/subscriptions/check/<user_id>', methods=['GET', 'OPTIONS'])
 def check_subscription(user_id):
@@ -2232,4 +2306,5 @@ if __name__ == "__main__":
     
     # ✅ Production mode: Gunicorn will handle this
     # Development mode: Flask development server
+
     app.run(host="0.0.0.0", port=port, debug=False)
